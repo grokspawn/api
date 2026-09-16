@@ -2,8 +2,10 @@ package internal
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
+	"github.com/blang/semver/v4"
 	"github.com/operator-framework/api/pkg/manifests"
 	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	"github.com/operator-framework/api/pkg/validation/errors"
@@ -22,6 +24,8 @@ var BundleValidator interfaces.Validator = interfaces.ValidatorFunc(validateBund
 // We will use this value to check the bundle compressed is < ~1MB
 const max_bundle_size = int64(1 << (10 * 2))
 
+const substitutesForAnnotationKey = "olm.substitutesFor"
+
 func validateBundles(objs ...interface{}) (results []errors.ManifestResult) {
 	for _, obj := range objs {
 		switch v := obj.(type) {
@@ -35,6 +39,7 @@ func validateBundles(objs ...interface{}) (results []errors.ManifestResult) {
 func validateBundle(bundle *manifests.Bundle) (result errors.ManifestResult) {
 	result = validateOwnedCRDs(bundle, bundle.CSV)
 	result.Name = bundle.CSV.Spec.Version.String()
+	result.Add(validateSkipRange(bundle)...)
 	saErrors := validateServiceAccounts(bundle)
 	if saErrors != nil {
 		result.Add(saErrors...)
@@ -52,6 +57,83 @@ func validateBundle(bundle *manifests.Bundle) (result errors.ManifestResult) {
 		result.Add(relatedImagesErrors...)
 	}
 	return result
+}
+
+var skipRangeUpperBoundPattern = regexp.MustCompile(`(^|[\s|])<\s*=?\s*(v?\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)`)
+
+type comparableVersion struct {
+	version semver.Version
+	release []semver.PRVersion
+}
+
+func (v comparableVersion) compare(other comparableVersion) int {
+	if cmp := v.version.Compare(other.version); cmp != 0 {
+		return cmp
+	}
+	return semver.Version{Pre: v.release}.Compare(semver.Version{Pre: other.release})
+}
+
+func parseRelease(build []string) ([]semver.PRVersion, error) {
+	releases := make([]semver.PRVersion, 0, len(build))
+	for _, segment := range build {
+		release, err := semver.NewPRVersion(segment)
+		if err != nil {
+			return nil, err
+		}
+		releases = append(releases, release)
+	}
+	return releases, nil
+}
+
+func comparableCSVVersion(csv *operatorsv1alpha1.ClusterServiceVersion) (comparableVersion, bool, error) {
+	version := csv.Spec.Version.Version
+	legacy := csv.GetAnnotations()[substitutesForAnnotationKey] != "" && len(csv.Spec.Release.Release) == 0 && len(version.Build) > 0
+	releases := csv.Spec.Release.Release
+	if legacy {
+		var err error
+		releases, err = parseRelease(version.Build)
+		if err != nil {
+			return comparableVersion{}, false, fmt.Errorf("invalid legacy release metadata: %w", err)
+		}
+		version.Build = nil
+	}
+	return comparableVersion{version: version, release: releases}, legacy, nil
+}
+
+func validateSkipRange(bundle *manifests.Bundle) []errors.Error {
+	if bundle == nil || bundle.CSV == nil {
+		return nil
+	}
+
+	skipRange := bundle.CSV.GetAnnotations()[operatorsv1alpha1.SkipRangeAnnotationKey]
+	bundleVersion, legacy, err := comparableCSVVersion(bundle.CSV)
+	if err != nil {
+		return []errors.Error{errors.ErrInvalidBundle(err.Error(), bundle.Name)}
+	}
+	for _, match := range skipRangeUpperBoundPattern.FindAllStringSubmatch(skipRange, -1) {
+		upperBound, err := semver.ParseTolerant(strings.TrimPrefix(match[2], "v"))
+		if err != nil {
+			continue
+		}
+		upperVersion := comparableVersion{version: upperBound}
+		if legacy && len(upperBound.Build) > 0 {
+			upperVersion.release, err = parseRelease(upperBound.Build)
+			if err != nil {
+				return []errors.Error{errors.ErrInvalidBundle(fmt.Sprintf("invalid skipRange upper bound %q legacy release metadata: %v", match[2], err), bundle.Name)}
+			}
+			upperVersion.version.Build = nil
+		}
+		if upperVersion.compare(bundleVersion) <= 0 {
+			continue
+		}
+
+		return []errors.Error{errors.ErrInvalidBundle(
+			fmt.Sprintf("skipRange upper bound %q is greater than bundle version %q", match[2], bundle.CSV.Spec.Version.String()),
+			bundle.Name,
+		)}
+	}
+
+	return nil
 }
 
 func validateBundleName(bundle *manifests.Bundle) []errors.Error {

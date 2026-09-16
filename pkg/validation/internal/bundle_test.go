@@ -5,9 +5,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/blang/semver/v4"
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
+	"github.com/operator-framework/api/pkg/lib/version"
 	"github.com/operator-framework/api/pkg/manifests"
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
 	"github.com/operator-framework/api/pkg/validation/errors"
@@ -70,6 +73,77 @@ func TestValidateBundle(t *testing.T) {
 				require.Contains(t, results[0].Errors[0].Error(), tt.errString)
 			} else {
 				require.False(t, results[0].HasError(), "found error when an error was not expected")
+			}
+		})
+	}
+}
+
+func TestValidateSkipRange(t *testing.T) {
+	for _, tt := range []struct {
+		description string
+		skipRange   string
+		hasError    bool
+	}{
+		{
+			description: "upper bound equal to bundle version",
+			skipRange:   "<1.2.3",
+		},
+		{
+			description: "upper bound below bundle version",
+			skipRange:   ">=1.0.0 <1.2.3",
+		},
+		{
+			description: "upper bound greater than bundle version",
+			skipRange:   ">=1.0.0 <1.2.4",
+			hasError:    true,
+		},
+		{
+			description: "no upper bound",
+			skipRange:   ">=1.0.0",
+		},
+		{
+			description: "legacy release upper bound equal to bundle version",
+			skipRange:   "<7.10.2-opr-2+0.1676475747.p",
+		},
+		{
+			description: "legacy release upper bound greater than bundle release",
+			skipRange:   "<7.10.2-opr-2+0.1676475748.p",
+			hasError:    true,
+		},
+	} {
+		t.Run(tt.description, func(t *testing.T) {
+			csvVersion := semver.MustParse("1.2.3")
+			annotations := map[string]string{}
+			if strings.HasPrefix(tt.description, "legacy") {
+				csvVersion = semver.MustParse("7.10.2-opr-2+0.1676475747.p")
+				annotations["olm.substitutesFor"] = "anakin.v7.10.2-opr-1"
+			}
+			annotations[v1alpha1.SkipRangeAnnotationKey] = tt.skipRange
+			bundle := &manifests.Bundle{
+				Name: "test-operator.v1.2.3",
+				CSV: &v1alpha1.ClusterServiceVersion{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:        "test-operator.v1.2.3",
+						Annotations: annotations,
+					},
+					Spec: v1alpha1.ClusterServiceVersionSpec{
+						Version: version.OperatorVersion{Version: csvVersion},
+					},
+				},
+				CompressedSize: 1,
+				Size:           1,
+			}
+
+			result := BundleValidator.Validate(bundle)[0]
+			if tt.hasError {
+				require.True(t, result.HasError())
+				if strings.HasPrefix(tt.description, "legacy") {
+					require.Contains(t, result.Errors[0].Error(), "0.1676475748.p")
+				} else {
+					require.Contains(t, result.Errors[0].Error(), `skipRange upper bound "1.2.4" is greater than bundle version "1.2.3"`)
+				}
+			} else {
+				require.False(t, result.HasError())
 			}
 		})
 	}
